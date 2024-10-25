@@ -110,7 +110,7 @@ const MyProfile = () => {
                 <option value="Female">Female</option>
               </select>
             ) : (
-              <p className="text-gray-400">{userData.gender}</p>
+              <p className="text-gray-500">{userData.gender}</p>
             )}
 
             <p className="font-medium">Birthday:</p>
@@ -123,7 +123,7 @@ const MyProfile = () => {
                 type="date"
               />
             ) : (
-              <p className="text-gray-400">{userData.dob}</p>
+              <p className="text-gray-500">{userData.dob}</p>
             )}
           </div>
         </div>
