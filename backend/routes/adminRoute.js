@@ -12,6 +12,8 @@ const adminRouter = express.Router();
 
 adminRouter.post("/add-doctors", authAdmin, upload.single("image"), addDoctor);
 adminRouter.post("/login", loginAdmin);
+
+//Protected Routes
 adminRouter.post("/all-doctors", authAdmin, allDoctors);
 adminRouter.post("/change-availability", authAdmin, changeAvailability);
 
