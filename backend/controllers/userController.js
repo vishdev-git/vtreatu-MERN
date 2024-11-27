@@ -5,14 +5,14 @@ import jwt from "jsonwebtoken";
 import { v2 as cloudinary } from "cloudinary";
 import doctorModel from "../models/doctorModel.js";
 import appointmentModel from "../models/appointmentModel.js";
+import razorpay from "razorpay";
+import crypto from 'crypto'
 
 //API to register user
 const registerUser = async (req, res) => {
   try {
     const { name, email, password } = req.body;
-    console.log(
-      `Credentials: name: ${name}, email:${email}, password: ${password}`
-    );
+    
     // Validate fields
     if (!name || !email || !password) {
       return res.json({
@@ -137,13 +137,10 @@ const bookAppointment = async (req, res) => {
       return res.json({ success: false, message: "Doctor not available" });
     }
     let slots_booked = docData.slots_booked;
-    console.log('Slots booked : ',slots_booked)
 
     //Checking for available slots
     if (slots_booked[slotDate]) {
-      console.log('Slots Date : ',slots_booked[slotDate])
       if (slots_booked[slotDate].includes(slotTime)) {
-        console.log('Slots booked : ',slots_booked[slotDate].includes(slotTime))
         return res.json({ success: false, message: "Slot not available" });
       } else {
         slots_booked[slotDate].push(slotTime);
@@ -166,7 +163,6 @@ const bookAppointment = async (req, res) => {
     };
 
     const newAppointment = new appointmentModel(appointmentData);
-    console.log(newAppointment)
     await newAppointment.save();
 
     //Save new slots data in docData
@@ -193,40 +189,196 @@ const listAppointment = async (req, res) => {
 
 //API to cancel appointment
 const cancelAppointment = async (req, res) => {
-  const { appointmentId } = req.body;
   try {
-    // Find the appointment in the database
-    const appointment = await Appointment.findById(appointmentId);
+    const { userId, appointmentId } = req.body;
+    const appointmentData = await appointmentModel.findById(appointmentId);
 
-    if (!appointment) {
-      return res.status(404).json({ success: false, message: 'Appointment not found' });
+    //Verifying appointment user
+    if (appointmentData.userId !== userId) {
+      return res.json({ succes: false, message: "Unauthorized action" });
     }
 
-    // Mark the appointment as canceled
-    appointment.cancelled = true;
-    await appointment.save();
+    await appointmentModel.findByIdAndUpdate(appointmentId, {
+      cancelled: true,
+    });
 
-    // Release the slot back to available slots
-    const doctor = await doctorModel.findById(appointment.doctorId);
+    //Releasing doctor's slot
+    const { docId, slotDate, slotTime } = appointmentData;
+    const doctorData = await doctorModel.findById(docId);
+    let slots_booked = doctorData.slots_booked;
+    console.log("slots booked : ", slots_booked);
+    console.log(
+      "filtered: ",
+      slots_booked[slotDate].filter((e) => e !== slotTime)
+    );
 
-    // Assuming slotDate and slotTime are stored in appointment object
-    const slotKey = `${appointment.slotDate}_${appointment.slotTime}`;
+    slots_booked[slotDate] = slots_booked[slotDate].filter(
+      (e) => e !== slotTime
+    );
+    console.log("After filtereation : ", slots_booked[slotDate]);
+    await doctorModel.findByIdAndUpdate(docId, { slots_booked });
 
-    // Remove from booked slots and add to available slots
-    if (doctor.slots_booked[appointment.slotDate]) {
-      doctor.slots_booked[appointment.slotDate] = doctor.slots_booked[appointment.slotDate].filter(time => time !== appointment.slotTime);
-      doctor.available_slots[appointment.slotDate].push(appointment.slotTime); // assuming this is how slots are managed
-    }
-
-    await doctor.save();
-    res.status(200).json({ success: true, message: 'Appointment canceled and slot released' });
+    res.json({ success: true, message: "Appointment Cancelled" });
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ success: false, message: 'Server error' });
+    console.log(error);
+    res.json({ success: false, message: error.message });
   }
 };
 
+const razorpayInstance = new razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET,
+});
 
+//API to verify razorpay
+const verifyRazorpay = async (req, res) => {
+  try {
+    const { 
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature 
+    } = req.body;
+
+    console.log('Starting payment verification for:', {
+      order_id: razorpay_order_id,
+      payment_id: razorpay_payment_id
+    });
+
+    // 1. First verify the signature
+    const body = razorpay_order_id + "|" + razorpay_payment_id;
+    const expectedSignature = crypto
+      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+      .update(body.toString())
+      .digest('hex');
+
+    const isAuthentic = expectedSignature === razorpay_signature;
+
+    if (!isAuthentic) {
+      console.log('Signature verification failed');
+      return res.json({ 
+        success: false, 
+        message: "Payment verification failed - invalid signature" 
+      });
+    }
+
+    // 2. Fetch payment details first
+    const paymentInfo = await razorpayInstance.payments.fetch(razorpay_payment_id);
+    console.log('Payment Info:', paymentInfo);
+
+    // 3. Check payment status and handle accordingly
+    if (paymentInfo.status === 'authorized') {
+      console.log('Payment authorized, attempting capture...');
+      try {
+        // Attempt to capture the payment
+        const captureResponse = await razorpayInstance.payments.capture(
+          razorpay_payment_id,
+          paymentInfo.amount,
+          paymentInfo.currency
+        );
+        console.log('Capture response:', captureResponse);
+        
+        // Update payment info after capture
+        const updatedPaymentInfo = await razorpayInstance.payments.fetch(razorpay_payment_id);
+        console.log('Updated payment info after capture:', updatedPaymentInfo);
+
+        if (updatedPaymentInfo.status === 'captured') {
+          // Fetch order details
+          const orderInfo = await razorpayInstance.orders.fetch(razorpay_order_id);
+          
+          // Update appointment
+          await appointmentModel.findByIdAndUpdate(orderInfo.receipt, {
+            payment: true,
+          });
+
+          return res.json({
+            success: true,
+            message: "Payment successful and captured",
+            paymentDetails: updatedPaymentInfo
+          });
+        }
+      } catch (captureError) {
+        console.error('Capture failed:', captureError);
+        return res.json({
+          success: false,
+          message: "Payment capture failed: " + captureError.message
+        });
+      }
+    } else if (paymentInfo.status === 'captured') {
+      // Payment was already captured
+      const orderInfo = await razorpayInstance.orders.fetch(razorpay_order_id);
+      
+      await appointmentModel.findByIdAndUpdate(orderInfo.receipt, {
+        payment: true,
+        razorpay_order_id,
+        razorpay_payment_id,
+        razorpay_signature,
+        paymentStatus: 'completed',
+        paymentDetails: paymentInfo
+      });
+
+      return res.json({
+        success: true,
+        message: "Payment Successfull",
+        paymentDetails: paymentInfo
+      });
+    } else {
+      console.log('Payment in invalid state:', paymentInfo.status);
+      return res.json({
+        success: false,
+        message: `Payment is in invalid state: ${paymentInfo.status}`,
+        paymentDetails: paymentInfo
+      });
+    }
+  } catch (error) {
+    console.error('Payment verification error:', error);
+    return res.json({
+      success: false,
+      message: "Payment verification failed: " + error.message,
+      error: error.stack
+    });
+  }
+};
+
+// Update the payment creation to ensure automatic capture is enabled
+const paymentRazorpay = async (req, res) => {
+  try {
+    const { appointmentId } = req.body;
+    const appointmentData = await appointmentModel.findById(appointmentId);
+
+    if (!appointmentData || appointmentData.cancelled) {
+      return res.json({
+        success: false,
+        message: "Invalid or cancelled appointment"
+      });
+    }
+
+    const options = {
+      amount: appointmentData.amount * 100,
+      currency: process.env.CURRENCY || 'INR',
+      receipt: appointmentId,
+      payment_capture: 1,
+      notes: {
+        appointmentId: appointmentId
+      }
+    };
+
+    console.log('Creating Razorpay order with options:', options);
+    const order = await razorpayInstance.orders.create(options);
+    console.log('Razorpay order created:', order);
+
+    res.json({ 
+      success: true, 
+      order,
+      message: "Order created successfully"
+    });
+  } catch (error) {
+    console.error('Order creation error:', error);
+    res.json({
+      success: false,
+      message: "Failed to create order: " + error.message
+    });
+  }
+};
 
 export {
   registerUser,
@@ -236,4 +388,6 @@ export {
   bookAppointment,
   listAppointment,
   cancelAppointment,
+  paymentRazorpay,
+  verifyRazorpay,
 };
